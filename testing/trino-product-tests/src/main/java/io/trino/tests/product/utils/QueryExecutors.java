@@ -16,7 +16,6 @@ package io.trino.tests.product.utils;
 import dev.failsafe.Failsafe;
 import dev.failsafe.RetryPolicy;
 import io.airlift.log.Logger;
-import io.trino.tempto.query.JdbcConnectivityParamsState;
 import io.trino.tempto.query.JdbcQueryExecutor;
 import io.trino.tempto.query.QueryExecutionException;
 import io.trino.tempto.query.QueryExecutor;
@@ -24,10 +23,9 @@ import io.trino.tempto.query.QueryResult;
 
 import java.sql.Connection;
 import java.time.temporal.ChronoUnit;
-import java.util.HashMap;
-import java.util.Map;
 
 import static io.trino.tempto.context.ThreadLocalTestContextHolder.testContext;
+import static io.trino.tests.product.utils.DeltaQueryExecutors.configureConnectionsPool;
 import static io.trino.tests.product.utils.HadoopTestUtils.ERROR_COMMITTING_WRITE_TO_HIVE_RETRY_POLICY;
 
 public final class QueryExecutors
@@ -114,8 +112,6 @@ public final class QueryExecutors
         };
     }
 
-    private static final Map<JdbcConnectivityParamsState, JdbcQueryExecutor> deltaQueryExecutors = new HashMap<>();
-
     public static QueryExecutor onDelta()
     {
         // Databricks clusters sometimes return HTTP 502 while starting, possibly when the gateway is up,
@@ -130,11 +126,9 @@ public final class QueryExecutors
                 .onRetry(event -> log.warn(event.getLastException(), "Query failed on attempt %d, will retry.", event.getAttemptCount()))
                 .build();
 
-        JdbcConnectivityParamsState jdbcParamsState = testContext().getDependency(JdbcConnectivityParamsState.class, "delta");
-
         return new QueryExecutor()
         {
-            private final QueryExecutor delegate = deltaQueryExecutors.computeIfAbsent(jdbcParamsState, state -> new DeltaQueryExecutor(testContext()));
+            private final QueryExecutor delegate = configureConnectionsPool((JdbcQueryExecutor) testContext().getDependency(QueryExecutor.class, "delta"));
 
             @Override
             public QueryResult executeQuery(String sql, QueryParam... params)
@@ -153,7 +147,6 @@ public final class QueryExecutors
             @Override
             public void close()
             {
-                deltaQueryExecutors.remove(jdbcParamsState);
                 delegate.close();
             }
         };

@@ -19,7 +19,6 @@ import dev.failsafe.RetryPolicy;
 import io.airlift.log.Logger;
 import io.airlift.resolver.ArtifactResolver;
 import io.airlift.resolver.DefaultArtifact;
-import io.trino.tempto.context.TestContext;
 import io.trino.tempto.query.JdbcConnectionsPool;
 import io.trino.tempto.query.JdbcConnectivityParamsState;
 import io.trino.tempto.query.JdbcQueryExecutor;
@@ -45,12 +44,10 @@ import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.airlift.resolver.ArtifactResolver.MAVEN_CENTRAL_URI;
 import static io.airlift.resolver.ArtifactResolver.USER_LOCAL_REPO;
 import static java.lang.ClassLoader.getPlatformClassLoader;
-import static java.util.Objects.requireNonNull;
 
-public class DeltaQueryExecutor
-        extends JdbcQueryExecutor
+public final class DeltaQueryExecutors
 {
-    private static final Logger log = Logger.get(DeltaQueryExecutor.class);
+    private static final Logger log = Logger.get(DeltaQueryExecutors.class);
 
     @GuardedBy("DRIVERS")
     private static final Map<String, Driver> DRIVERS = new HashMap<>();
@@ -61,44 +58,55 @@ public class DeltaQueryExecutor
             .onRetry(event -> log.warn(event.getLastException(), "Download failed on attempt %d, will retry.", event.getAttemptCount()))
             .build();
 
-    private final JdbcConnectivityParamsState jdbcParamsState;
-    private final Field connectionField;
+    private static final JdbcConnectionsPool deltaConnectionPool = deltaConnectionsPool();
 
-    public DeltaQueryExecutor(TestContext testContext)
+    private DeltaQueryExecutors() {}
+
+    public static JdbcQueryExecutor configureConnectionsPool(JdbcQueryExecutor jdbcQueryExecutor)
     {
-        super(testContext.getDependency(JdbcConnectivityParamsState.class, "delta"), mockConnectionsPool(), testContext);
-        jdbcParamsState = testContext.getDependency(JdbcConnectivityParamsState.class, "delta");
         try {
-            connectionField = getClass().getSuperclass().getDeclaredField("connection");
-            connectionField.setAccessible(true);
+            Field field = jdbcQueryExecutor.getClass().getDeclaredField("jdbcConnectionsPool");
+            field.setAccessible(true);
+            field.set(jdbcQueryExecutor, deltaConnectionPool);
+            return jdbcQueryExecutor;
         }
-        catch (ReflectiveOperationException e) {
+        catch (NoSuchFieldException | IllegalAccessException e) {
             throw new RuntimeException(e);
         }
     }
 
-    @Override
-    public void openConnection()
+    private static JdbcConnectionsPool deltaConnectionsPool()
     {
-        closeConnection();
+        return new JdbcConnectionsPool()
+        {
+            private final Map<JdbcConnectivityParamsState, Connection> connections = new HashMap<>();
 
-        Driver driver;
-        synchronized (DRIVERS) {
-            driver = DRIVERS.computeIfAbsent(jdbcParamsState.driverClass, className -> Failsafe.with(loadDatabaseDriverRetryPolicy)
-                    .get(() -> loadDatabaseDriver(className)));
-        }
+            @Override
+            public Connection connectionFor(JdbcConnectivityParamsState jdbcParamsState)
+            {
+                Driver driver;
+                synchronized (DRIVERS) {
+                    driver = DRIVERS.computeIfAbsent(jdbcParamsState.driverClass, className -> Failsafe.with(loadDatabaseDriverRetryPolicy)
+                            .get(() -> loadDatabaseDriver(className)));
+                }
 
-        Properties properties = new Properties();
-        properties.put("user", jdbcParamsState.user);
-        properties.put("password", jdbcParamsState.password);
-        try {
-            Connection connection = driver.connect(jdbcParamsState.url, properties);
-            requireNonNull(connection, "connection is null");
-            connectionField.set(this, connection);
-        }
-        catch (SQLException | ReflectiveOperationException e) {
-            throw new RuntimeException(e);
-        }
+                Properties properties = new Properties();
+                properties.put("user", jdbcParamsState.user);
+                properties.put("password", jdbcParamsState.password);
+
+                try {
+                    Connection connection = connections.get(jdbcParamsState);
+                    if (connection == null || connection.isClosed()) {
+                        connection = driver.connect(jdbcParamsState.url, properties);
+                        connections.put(jdbcParamsState, connection);
+                    }
+                    return connection;
+                }
+                catch (SQLException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        };
     }
 
     private static Driver loadDatabaseDriver(String driverClassName)
@@ -147,17 +155,5 @@ public class DeltaQueryExecutor
             return new DefaultArtifact("com.databricks:databricks-jdbc:2.6.32");
         }
         throw new IllegalArgumentException("Unexpected driver class: " + driverClass);
-    }
-
-    private static JdbcConnectionsPool mockConnectionsPool()
-    {
-        return new JdbcConnectionsPool()
-        {
-            @Override
-            public Connection connectionFor(JdbcConnectivityParamsState jdbcParamsState)
-            {
-                throw new UnsupportedOperationException();
-            }
-        };
     }
 }
