@@ -16,7 +16,6 @@ package io.trino.tests.product.utils;
 import dev.failsafe.Failsafe;
 import dev.failsafe.RetryPolicy;
 import io.airlift.log.Logger;
-import io.trino.tempto.query.JdbcQueryExecutor;
 import io.trino.tempto.query.QueryExecutionException;
 import io.trino.tempto.query.QueryExecutor;
 import io.trino.tempto.query.QueryResult;
@@ -128,7 +127,7 @@ public final class QueryExecutors
 
         return new QueryExecutor()
         {
-            private final QueryExecutor delegate = configureConnectionsPool((JdbcQueryExecutor) testContext().getDependency(QueryExecutor.class, "delta"));
+            private final QueryExecutor delegate = configureConnectionsPool(testContext());
 
             @Override
             public QueryResult executeQuery(String sql, QueryParam... params)

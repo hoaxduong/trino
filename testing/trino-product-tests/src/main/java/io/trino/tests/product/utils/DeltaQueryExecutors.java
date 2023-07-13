@@ -19,9 +19,11 @@ import dev.failsafe.RetryPolicy;
 import io.airlift.log.Logger;
 import io.airlift.resolver.ArtifactResolver;
 import io.airlift.resolver.DefaultArtifact;
+import io.trino.tempto.context.TestContext;
 import io.trino.tempto.query.JdbcConnectionsPool;
 import io.trino.tempto.query.JdbcConnectivityParamsState;
 import io.trino.tempto.query.JdbcQueryExecutor;
+import io.trino.tempto.query.QueryExecutor;
 import org.sonatype.aether.artifact.Artifact;
 
 import javax.annotation.concurrent.GuardedBy;
@@ -43,6 +45,7 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.airlift.resolver.ArtifactResolver.MAVEN_CENTRAL_URI;
 import static io.airlift.resolver.ArtifactResolver.USER_LOCAL_REPO;
+import static io.trino.tempto.context.ThreadLocalTestContextHolder.testContext;
 import static java.lang.ClassLoader.getPlatformClassLoader;
 
 public final class DeltaQueryExecutors
@@ -58,16 +61,18 @@ public final class DeltaQueryExecutors
             .onRetry(event -> log.warn(event.getLastException(), "Download failed on attempt %d, will retry.", event.getAttemptCount()))
             .build();
 
-    private static final JdbcConnectionsPool deltaConnectionPool = deltaConnectionsPool();
+    private static final DeltaConnectionsPool deltaConnectionPool = new DeltaConnectionsPool();
 
     private DeltaQueryExecutors() {}
 
-    public static JdbcQueryExecutor configureConnectionsPool(JdbcQueryExecutor jdbcQueryExecutor)
+    public static JdbcQueryExecutor configureConnectionsPool(TestContext testContext)
     {
+        JdbcQueryExecutor jdbcQueryExecutor = (JdbcQueryExecutor) testContext().getDependency(QueryExecutor.class, "delta");
         try {
             Field field = jdbcQueryExecutor.getClass().getDeclaredField("jdbcConnectionsPool");
             field.setAccessible(true);
             field.set(jdbcQueryExecutor, deltaConnectionPool);
+            testContext.registerCloseCallback(context -> deltaConnectionPool.close());
             return jdbcQueryExecutor;
         }
         catch (NoSuchFieldException | IllegalAccessException e) {
@@ -75,38 +80,38 @@ public final class DeltaQueryExecutors
         }
     }
 
-    private static JdbcConnectionsPool deltaConnectionsPool()
+    private static class DeltaConnectionsPool
+            extends JdbcConnectionsPool
     {
-        return new JdbcConnectionsPool()
+        private final Map<JdbcConnectivityParamsState, Connection> connections = new HashMap<>();
+
+        @Override
+        public Connection connectionFor(JdbcConnectivityParamsState jdbcParamsState)
         {
-            private final Map<JdbcConnectivityParamsState, Connection> connections = new HashMap<>();
+            Driver driver;
+            synchronized (DRIVERS) {
+                driver = DRIVERS.computeIfAbsent(jdbcParamsState.driverClass, className -> Failsafe.with(loadDatabaseDriverRetryPolicy)
+                        .get(() -> loadDatabaseDriver(className)));
+            }
 
-            @Override
-            public Connection connectionFor(JdbcConnectivityParamsState jdbcParamsState)
-            {
-                Driver driver;
-                synchronized (DRIVERS) {
-                    driver = DRIVERS.computeIfAbsent(jdbcParamsState.driverClass, className -> Failsafe.with(loadDatabaseDriverRetryPolicy)
-                            .get(() -> loadDatabaseDriver(className)));
-                }
+            Properties properties = new Properties();
+            properties.put("user", jdbcParamsState.user);
+            properties.put("password", jdbcParamsState.password);
 
-                Properties properties = new Properties();
-                properties.put("user", jdbcParamsState.user);
-                properties.put("password", jdbcParamsState.password);
-
+            return connections.computeIfAbsent(jdbcParamsState, params -> {
                 try {
-                    Connection connection = connections.get(jdbcParamsState);
-                    if (connection == null || connection.isClosed()) {
-                        connection = driver.connect(jdbcParamsState.url, properties);
-                        connections.put(jdbcParamsState, connection);
-                    }
-                    return connection;
+                    return driver.connect(jdbcParamsState.url, properties);
                 }
                 catch (SQLException e) {
                     throw new RuntimeException(e);
                 }
-            }
-        };
+            });
+        }
+
+        public void close()
+        {
+            connections.clear();
+        }
     }
 
     private static Driver loadDatabaseDriver(String driverClassName)
