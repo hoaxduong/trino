@@ -496,6 +496,24 @@ public class TestIcebergMetadataFileOperations
         assertUpdate("DROP TABLE " + tableName);
     }
 
+    @Test
+    public void testInformationSchemaColumns()
+    {
+        int tables = 3;
+        for (int i = 0; i < tables; i++) {
+            assertUpdate("CREATE TABLE test_select_i_s_columns" + i + "(id VARCHAR, age INT)");
+        }
+
+        assertFileSystemAccesses("SELECT * FROM information_schema.columns WHERE table_name LIKE 'test_select_i_s_columns%'",
+                ImmutableMultiset.<FileOperation>builder()
+                        .addCopies(new FileOperation(METADATA_JSON, INPUT_FILE_NEW_STREAM), 3)
+                        .build());
+
+        for (int i = 0; i < tables; i++) {
+            assertUpdate("DROP TABLE test_select_i_s_columns" + i);
+        }
+    }
+
     private void assertFileSystemAccesses(@Language("SQL") String query, Multiset<FileOperation> expectedAccesses)
     {
         assertFileSystemAccesses(getSession(), query, expectedAccesses);
